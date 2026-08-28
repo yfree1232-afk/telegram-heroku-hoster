@@ -15,7 +15,6 @@ from utils.helpers import parse_config_vars_text, github_repo_to_tarball
 router = Router()
 
 def make_safe_heroku_name(name: str) -> str:
-    # Lowercase, alphanumeric and hyphens only, between 3-30 chars
     cleaned = re.sub(r'[^a-z0-9-]', '', name.lower().replace(" ", "-"))
     if len(cleaned) < 3:
         cleaned = "bot-host"
@@ -63,10 +62,14 @@ async def cb_deploy_template(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Template not found.", show_alert=True)
         return
 
+    req_vars = template.get("required_vars", [])
+    if isinstance(req_vars, str):
+        req_vars = json.loads(req_vars)
+
     await state.update_data(
         template_name=template["name"],
         repo_url=template["repo_url"],
-        required_vars=json.loads(template["required_vars"])
+        required_vars=req_vars
     )
 
     await callback.message.edit_text(
@@ -207,12 +210,13 @@ async def cb_trigger_deploy(callback: CallbackQuery, state: FSMContext):
     await status_msg.edit_text("⚡ **Starting 24/7 worker process...**", parse_mode="Markdown")
     await heroku_client.scale_dyno(app_name, dyno_type="worker", quantity=1)
 
-    # 5. Register in DB
+    # 5. Register in MongoDB with full config_vars saved
     app_db_id = await db.register_app(
         user_id=user_id,
         heroku_app_name=app_name,
         display_name=display_name,
         repo_url=repo_url,
+        config_vars=config_vars,
         dyno_type="worker",
         duration_days=30,
         is_admin_app=is_admin
