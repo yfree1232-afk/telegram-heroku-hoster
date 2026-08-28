@@ -88,14 +88,14 @@ async def cb_config_vars(callback: CallbackQuery):
 
     ok, vars_dict = await heroku_client.get_config_vars(app["heroku_app_name"])
     if not ok:
-        return await callback.answer(f"Error fetching vars: {vars_dict}", show_alert=True)
+        # Fallback to database saved config vars
+        vars_dict = app.get("config_vars", {})
 
     if not vars_dict:
         vars_text = "_No environment variables configured._"
     else:
         vars_lines = []
         for k, v in vars_dict.items():
-            # Mask sensitive values slightly for security
             v_str = str(v)
             masked = v_str[:3] + ("*" * 6) + v_str[-2:] if len(v_str) > 8 else "****"
             vars_lines.append(f"• `{k}` = `{masked}`")
@@ -143,6 +143,8 @@ async def msg_receive_var_update(message: Message, state: FSMContext):
         return await message.reply("❌ Invalid format. Please provide in `KEY=VALUE` format.")
 
     ok, res = await heroku_client.update_config_vars(app["heroku_app_name"], parsed)
+    # Synchronize MongoDB
+    await db.update_app_config_vars(app_id, parsed)
     await state.clear()
 
     if ok:
@@ -154,7 +156,7 @@ async def msg_receive_var_update(message: Message, state: FSMContext):
             parse_mode="Markdown"
         )
     else:
-        await message.reply(f"❌ Failed to update variables: {res}")
+        await message.reply(f"⚠️ Saved to database, but Heroku returned: {res}")
 
 @router.callback_query(F.data.startswith("app_renew_"))
 async def cb_renew_prompt(callback: CallbackQuery):
@@ -167,7 +169,6 @@ async def cb_renew_prompt(callback: CallbackQuery):
 
         app = await db.get_app_by_id(app_id)
         new_exp = await db.extend_app_subscription(app_id, days=30)
-        # Ensure dyno is turned on
         await heroku_client.scale_dyno(app["heroku_app_name"], dyno_type=app.get("dyno_type", "worker"), quantity=1)
 
         await callback.message.edit_text(
