@@ -18,3 +18,4 @@ class AdminStates(StatesGroup):
     waiting_for_user_id_credit = State()
     waiting_for_credit_amount = State()
     waiting_for_price_update = State()
+    waiting_for_restore_key = State()
