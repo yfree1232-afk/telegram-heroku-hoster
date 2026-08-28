@@ -32,10 +32,11 @@ def get_admin_keyboard(pending_count: int = 0) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⚡ Admin Personal Apps", callback_data="admin_personal_apps")
         ],
         [
-            InlineKeyboardButton(text="📢 Broadcast Announcement", callback_data="admin_broadcast"),
-            InlineKeyboardButton(text="➕ Add Balance to User", callback_data="admin_credit_user")
+            InlineKeyboardButton(text="🔄 Auto-Restore All Bots", callback_data="admin_restore_prompt"),
+            InlineKeyboardButton(text="📢 Broadcast Announcement", callback_data="admin_broadcast")
         ],
         [
+            InlineKeyboardButton(text="➕ Add Balance to User", callback_data="admin_credit_user"),
             InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="back_to_main")
         ]
     ]
