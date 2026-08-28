@@ -1,153 +1,116 @@
-import aiosqlite
-import json
+import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
+from motor.motor_asyncio import AsyncIOMotorClient
 from config import config
 
-class Database:
-    def __init__(self, db_path: str = config.DATABASE_PATH):
-        self.db_path = db_path
+logger = logging.getLogger(__name__)
+
+class MongoDB:
+    def __init__(self, uri: str = config.MONGO_URI, db_name: str = config.DATABASE_NAME):
+        self.client = AsyncIOMotorClient(uri)
+        self.db = self.client[db_name]
+        
+        # Collections
+        self.users = self.db["users"]
+        self.apps = self.db["apps"]
+        self.payments = self.db["payments"]
+        self.templates = self.db["templates"]
+        self.settings = self.db["settings"]
 
     async def init(self):
-        """Initialize database tables"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    balance INTEGER DEFAULT 0,
-                    is_banned INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS apps (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    heroku_app_name TEXT UNIQUE NOT NULL,
-                    display_name TEXT NOT NULL,
-                    repo_url TEXT,
-                    dyno_type TEXT DEFAULT 'worker',
-                    status TEXT DEFAULT 'stopped',
-                    expires_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_admin_app INTEGER DEFAULT 0,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
-            """)
-
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS payments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    amount INTEGER NOT NULL,
-                    utr_number TEXT,
-                    screenshot_file_id TEXT,
-                    status TEXT DEFAULT 'pending',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    reviewed_by INTEGER,
-                    reviewed_at TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
-            """)
-
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS templates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    description TEXT,
-                    repo_url TEXT NOT NULL,
-                    required_vars TEXT DEFAULT '[]'
-                )
-            """)
-            await db.commit()
+        """Initialize indexes and default seed data"""
+        try:
+            # Create indexes
+            await self.users.create_index("user_id", unique=True)
+            await self.apps.create_index("id", unique=True)
+            await self.apps.create_index("heroku_app_name")
+            await self.payments.create_index("id", unique=True)
+            await self.templates.create_index("id", unique=True)
 
             # Seed default templates if empty
-            async with db.execute("SELECT COUNT(*) FROM templates") as cursor:
-                count = (await cursor.fetchone())[0]
-                if count == 0:
-                    default_templates = [
-                        (
-                            "Telegram Music Bot",
-                            "High-quality VC Music Streaming Bot with YouTube/Spotify support.",
-                            "https://github.com/AnonymousX1025/AnonXMusic",
-                            json.dumps(["BOT_TOKEN", "API_ID", "API_HASH", "MONGO_DB_URI", "STRING_SESSION", "OWNER_ID"])
-                        ),
-                        (
-                            "Auto Filter & File Store Bot",
-                            "Channel filter & auto-index telegram file sharing bot.",
-                            "https://github.com/EvamariaTG/EvaMaria",
-                            json.dumps(["BOT_TOKEN", "API_ID", "API_HASH", "DATABASE_URI", "DATABASE_NAME", "ADMINS"])
-                        ),
-                        (
-                            "Telegram Userbot",
-                            "Powerful helper userbot for personal Telegram account automation.",
-                            "https://github.com/TeamYukki/YukkiMusicBot",
-                            json.dumps(["BOT_TOKEN", "API_ID", "API_HASH", "MONGO_DB_URI", "STRING_SESSION", "OWNER_ID"])
-                        )
-                    ]
-                    await db.executemany(
-                        "INSERT INTO templates (name, description, repo_url, required_vars) VALUES (?, ?, ?, ?)",
-                        default_templates
-                    )
-                    await db.commit()
+            count = await self.templates.count_documents({})
+            if count == 0:
+                default_templates = [
+                    {
+                        "id": 1,
+                        "name": "Telegram Music Bot",
+                        "description": "High-quality VC Music Streaming Bot with YouTube/Spotify support.",
+                        "repo_url": "https://github.com/AnonymousX1025/AnonXMusic",
+                        "required_vars": ["BOT_TOKEN", "API_ID", "API_HASH", "MONGO_DB_URI", "STRING_SESSION", "OWNER_ID"]
+                    },
+                    {
+                        "id": 2,
+                        "name": "Auto Filter & File Store Bot",
+                        "description": "Channel filter & auto-index telegram file sharing bot.",
+                        "repo_url": "https://github.com/EvamariaTG/EvaMaria",
+                        "required_vars": ["BOT_TOKEN", "API_ID", "API_HASH", "DATABASE_URI", "DATABASE_NAME", "ADMINS"]
+                    },
+                    {
+                        "id": 3,
+                        "name": "Telegram Userbot",
+                        "description": "Powerful helper userbot for personal Telegram account automation.",
+                        "repo_url": "https://github.com/TeamYukki/YukkiMusicBot",
+                        "required_vars": ["BOT_TOKEN", "API_ID", "API_HASH", "MONGO_DB_URI", "STRING_SESSION", "OWNER_ID"]
+                    }
+                ]
+                await self.templates.insert_many(default_templates)
+            logger.info("MongoDB initialized successfully.")
+        except Exception as e:
+            logger.exception(f"Failed to initialize MongoDB: {e}")
+
+    async def _get_next_id(self, collection_name: str) -> int:
+        col = self.db[collection_name]
+        last_doc = await col.find_one(sort=[("id", -1)])
+        return (last_doc["id"] + 1) if last_doc and "id" in last_doc else 1
 
     # --- User Operations ---
     async def get_or_create_user(self, user_id: int, username: Optional[str] = None, first_name: Optional[str] = None) -> Dict[str, Any]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                user = await cursor.fetchone()
-                if user:
-                    # Update username/first_name if changed
-                    await db.execute(
-                        "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
-                        (username, first_name, user_id)
-                    )
-                    await db.commit()
-                    return dict(user)
-                
-                await db.execute(
-                    "INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
-                    (user_id, username, first_name)
-                )
-                await db.commit()
-                async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur2:
-                    return dict(await cur2.fetchone())
+        user = await self.users.find_one({"user_id": user_id})
+        if user:
+            await self.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"username": username, "first_name": first_name}}
+            )
+            user["username"] = username
+            user["first_name"] = first_name
+            return user
+
+        new_user = {
+            "user_id": user_id,
+            "username": username,
+            "first_name": first_name,
+            "balance": 0,
+            "is_banned": False,
+            "created_at": datetime.utcnow()
+        }
+        await self.users.insert_one(new_user)
+        return new_user
 
     async def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        return await self.users.find_one({"user_id": user_id})
 
     async def add_balance(self, user_id: int, amount: int) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-            await db.commit()
-            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                res = await cursor.fetchone()
-                return res[0] if res else 0
+        await self.users.update_one(
+            {"user_id": user_id},
+            {"$inc": {"balance": amount}}
+        )
+        user = await self.users.find_one({"user_id": user_id})
+        return user.get("balance", 0) if user else 0
 
     async def deduct_balance(self, user_id: int, amount: int) -> bool:
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                res = await cursor.fetchone()
-                if not res or res[0] < amount:
-                    return False
-            await db.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
-            await db.commit()
-            return True
+        user = await self.users.find_one({"user_id": user_id})
+        if not user or user.get("balance", 0) < amount:
+            return False
+        await self.users.update_one(
+            {"user_id": user_id},
+            {"$inc": {"balance": -amount}}
+        )
+        return True
 
     async def get_all_users(self) -> List[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM users ORDER BY created_at DESC") as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        cursor = self.users.find().sort("created_at", -1)
+        return await cursor.to_list(length=None)
 
     # --- App Operations ---
     async def register_app(
@@ -156,125 +119,132 @@ class Database:
         heroku_app_name: str,
         display_name: str,
         repo_url: Optional[str] = None,
+        config_vars: Optional[Dict[str, str]] = None,
         dyno_type: str = "worker",
         duration_days: int = 30,
         is_admin_app: bool = False
     ) -> int:
+        app_id = await self._get_next_id("apps")
         expires_at = datetime.utcnow() + timedelta(days=duration_days) if not is_admin_app else None
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """INSERT INTO apps 
-                   (user_id, heroku_app_name, display_name, repo_url, dyno_type, status, expires_at, is_admin_app) 
-                   VALUES (?, ?, ?, ?, ?, 'running', ?, ?)""",
-                (user_id, heroku_app_name, display_name, repo_url, dyno_type, expires_at, 1 if is_admin_app else 0)
-            )
-            await db.commit()
-            return cursor.lastrowid
+        
+        doc = {
+            "id": app_id,
+            "user_id": user_id,
+            "heroku_app_name": heroku_app_name,
+            "display_name": display_name,
+            "repo_url": repo_url,
+            "config_vars": config_vars or {},
+            "dyno_type": dyno_type,
+            "status": "running",
+            "expires_at": expires_at.isoformat() if expires_at else None,
+            "created_at": datetime.utcnow().isoformat(),
+            "is_admin_app": bool(is_admin_app)
+        }
+        await self.apps.insert_one(doc)
+        return app_id
 
     async def get_user_apps(self, user_id: int) -> List[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM apps WHERE user_id = ? ORDER BY id DESC", (user_id,)) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        cursor = self.apps.find({"user_id": user_id}).sort("id", -1)
+        return await cursor.to_list(length=None)
 
     async def get_app_by_name(self, heroku_app_name: str) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM apps WHERE heroku_app_name = ?", (heroku_app_name,)) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        return await self.apps.find_one({"heroku_app_name": heroku_app_name})
 
     async def get_app_by_id(self, app_id: int) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM apps WHERE id = ?", (app_id,)) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        return await self.apps.find_one({"id": app_id})
 
     async def update_app_status(self, app_id: int, status: str):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE apps SET status = ? WHERE id = ?", (status, app_id))
-            await db.commit()
+        await self.apps.update_one({"id": app_id}, {"$set": {"status": status}})
+
+    async def update_app_config_vars(self, app_id: int, updated_vars: Dict[str, Optional[str]]):
+        app = await self.get_app_by_id(app_id)
+        if not app:
+            return
+        current_vars = app.get("config_vars", {})
+        for k, v in updated_vars.items():
+            if v is None:
+                current_vars.pop(k, None)
+            else:
+                current_vars[k] = v
+        await self.apps.update_one({"id": app_id}, {"$set": {"config_vars": current_vars}})
+
+    async def update_app_heroku_name(self, app_id: int, new_heroku_name: str):
+        await self.apps.update_one({"id": app_id}, {"$set": {"heroku_app_name": new_heroku_name}})
 
     async def extend_app_subscription(self, app_id: int, days: int = 30) -> datetime:
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT expires_at FROM apps WHERE id = ?", (app_id,)) as cursor:
-                res = await cursor.fetchone()
-                now = datetime.utcnow()
-                if res and res[0]:
-                    current_exp = datetime.fromisoformat(res[0])
-                    new_exp = max(now, current_exp) + timedelta(days=days)
-                else:
-                    new_exp = now + timedelta(days=days)
-                
-                await db.execute("UPDATE apps SET expires_at = ?, status = 'running' WHERE id = ?", (new_exp, app_id))
-                await db.commit()
-                return new_exp
+        app = await self.get_app_by_id(app_id)
+        now = datetime.utcnow()
+        if app and app.get("expires_at"):
+            try:
+                current_exp = datetime.fromisoformat(app["expires_at"])
+                new_exp = max(now, current_exp) + timedelta(days=days)
+            except Exception:
+                new_exp = now + timedelta(days=days)
+        else:
+            new_exp = now + timedelta(days=days)
+
+        await self.apps.update_one(
+            {"id": app_id},
+            {"$set": {"expires_at": new_exp.isoformat(), "status": "running"}}
+        )
+        return new_exp
 
     async def delete_app_record(self, app_id: int):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM apps WHERE id = ?", (app_id,))
-            await db.commit()
+        await self.apps.delete_one({"id": app_id})
 
     async def get_all_active_apps(self) -> List[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM apps ORDER BY id DESC") as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
-
-    async def get_expired_apps(self) -> List[Dict[str, Any]]:
-        now = datetime.utcnow().isoformat()
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT * FROM apps WHERE is_admin_app = 0 AND expires_at <= ? AND status != 'stopped'", 
-                (now,)
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        cursor = self.apps.find().sort("id", -1)
+        return await cursor.to_list(length=None)
 
     # --- Payment Operations ---
     async def create_payment_request(self, user_id: int, amount: int, utr_number: Optional[str] = None, screenshot_file_id: Optional[str] = None) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "INSERT INTO payments (user_id, amount, utr_number, screenshot_file_id, status) VALUES (?, ?, ?, ?, 'pending')",
-                (user_id, amount, utr_number, screenshot_file_id)
-            )
-            await db.commit()
-            return cursor.lastrowid
+        payment_id = await self._get_next_id("payments")
+        doc = {
+            "id": payment_id,
+            "user_id": user_id,
+            "amount": amount,
+            "utr_number": utr_number,
+            "screenshot_file_id": screenshot_file_id,
+            "status": "pending",
+            "created_at": datetime.utcnow().isoformat(),
+            "reviewed_by": None,
+            "reviewed_at": None
+        }
+        await self.payments.insert_one(doc)
+        return payment_id
 
     async def get_payment(self, payment_id: int) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        return await self.payments.find_one({"id": payment_id})
 
     async def update_payment_status(self, payment_id: int, status: str, reviewed_by: int) -> bool:
-        async with aiosqlite.connect(self.db_path) as db:
-            now = datetime.utcnow().isoformat()
-            await db.execute(
-                "UPDATE payments SET status = ?, reviewed_by = ?, reviewed_at = ? WHERE id = ?",
-                (status, reviewed_by, now, payment_id)
-            )
-            await db.commit()
-            return True
+        await self.payments.update_one(
+            {"id": payment_id},
+            {"$set": {
+                "status": status,
+                "reviewed_by": reviewed_by,
+                "reviewed_at": datetime.utcnow().isoformat()
+            }}
+        )
+        return True
 
     # --- Template Operations ---
     async def get_templates(self) -> List[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM templates") as cursor:
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+        cursor = self.templates.find()
+        return await cursor.to_list(length=None)
 
     async def get_template_by_id(self, template_id: int) -> Optional[Dict[str, Any]]:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM templates WHERE id = ?", (template_id,)) as cursor:
-                row = await cursor.fetchone()
-                return dict(row) if row else None
+        return await self.templates.find_one({"id": template_id})
 
-db = Database()
+    # --- Global Dynamic Settings ---
+    async def get_setting(self, key: str, default: Any = None) -> Any:
+        doc = await self.settings.find_one({"key": key})
+        return doc["value"] if doc and "value" in doc else default
+
+    async def set_setting(self, key: str, value: Any):
+        await self.settings.update_one(
+            {"key": key},
+            {"$set": {"value": value, "updated_at": datetime.utcnow().isoformat()}},
+            upsert=True
+        )
+
+db = MongoDB()
